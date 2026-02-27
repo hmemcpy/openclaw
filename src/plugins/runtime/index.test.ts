@@ -39,4 +39,11 @@ describe("plugin runtime command execution", () => {
     ).rejects.toThrow("boom");
     expect(runCommandWithTimeoutMock).toHaveBeenCalledWith(["echo", "hello"], { timeoutMs: 1000 });
   });
+
+  it("resolves sync lazy message action adapters", () => {
+    const runtime = createPluginRuntime();
+    expect(typeof runtime.channel.discord.messageActions.handleAction).toBe("function");
+    expect(typeof runtime.channel.signal.messageActions.handleAction).toBe("function");
+    expect(typeof runtime.channel.telegram.messageActions.handleAction).toBe("function");
+  });
 });

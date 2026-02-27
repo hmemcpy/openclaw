@@ -1,4 +1,8 @@
+import fs from "node:fs";
 import { createRequire } from "node:module";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createJiti } from "jiti";
 import { resolveEffectiveMessagesConfig, resolveHumanDelayConfig } from "../../agents/identity.js";
 import { createMemoryGetTool, createMemorySearchTool } from "../../agents/tools/memory-tool.js";
 import {
@@ -84,11 +88,86 @@ import { formatNativeDependencyHint } from "./native-deps.js";
 import type { PluginRuntime } from "./types.js";
 
 const runtimeRequire = createRequire(import.meta.url);
+let runtimeJiti: ReturnType<typeof createJiti> | null = null;
 
 let cachedVersion: string | null = null;
 
-function requireRuntimeModule<T>(specifier: string): T {
-  return runtimeRequire(specifier) as T;
+type RuntimeModuleRef = {
+  srcFile: string;
+  distFile: string;
+  modulePath?: string;
+};
+
+const runtimeModulePathCache = new Map<string, string>();
+
+function getRuntimeJiti(): ReturnType<typeof createJiti> {
+  if (runtimeJiti) {
+    return runtimeJiti;
+  }
+  runtimeJiti = createJiti(import.meta.url, {
+    interopDefault: true,
+    extensions: [".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs", ".json"],
+  });
+  return runtimeJiti;
+}
+
+function resolveRuntimeModuleFile(params: RuntimeModuleRef): string | null {
+  const cacheKey = `${params.srcFile}::${params.distFile}`;
+  const cached = runtimeModulePathCache.get(cacheKey);
+  if (cached && fs.existsSync(cached)) {
+    return cached;
+  }
+  try {
+    const modulePath = params.modulePath ?? fileURLToPath(import.meta.url);
+    const normalizedModulePath = modulePath.replace(/\\/g, "/");
+    const isDistRuntime = normalizedModulePath.includes("/dist/");
+    const isProduction = process.env.NODE_ENV === "production";
+    const isTest = process.env.VITEST || process.env.NODE_ENV === "test";
+    let cursor = path.dirname(modulePath);
+    for (let i = 0; i < 8; i += 1) {
+      const srcCandidate = path.join(cursor, params.srcFile);
+      const distCandidate = path.join(cursor, params.distFile);
+      const orderedCandidates = isDistRuntime
+        ? [distCandidate, srcCandidate]
+        : isProduction
+          ? isTest
+            ? [distCandidate, srcCandidate]
+            : [distCandidate]
+          : [srcCandidate, distCandidate];
+      for (const candidate of orderedCandidates) {
+        if (fs.existsSync(candidate)) {
+          runtimeModulePathCache.set(cacheKey, candidate);
+          return candidate;
+        }
+      }
+      const parent = path.dirname(cursor);
+      if (parent === cursor) {
+        break;
+      }
+      cursor = parent;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function requireRuntimeModule<T>(moduleRef: RuntimeModuleRef): T {
+  const resolved = resolveRuntimeModuleFile(moduleRef);
+  if (!resolved) {
+    throw new Error(
+      `Failed to resolve runtime module: ${moduleRef.distFile} (source fallback: ${moduleRef.srcFile})`,
+    );
+  }
+  try {
+    return runtimeRequire(resolved) as T;
+  } catch (error) {
+    // `createRequire` cannot always execute TypeScript source modules in dev/test; use Jiti there.
+    if (resolved.endsWith(".ts") || resolved.endsWith(".mts") || resolved.endsWith(".cts")) {
+      return getRuntimeJiti()(resolved) as T;
+    }
+    throw error;
+  }
 }
 
 function createLazyAdapter<T extends object>(load: () => T): T {
@@ -530,6 +609,45 @@ let imessageSendPromise: Promise<typeof import("../../imessage/send.js")> | null
 let lineMonitorPromise: Promise<typeof import("../../line/monitor.js")> | null = null;
 let lineProbePromise: Promise<typeof import("../../line/probe.js")> | null = null;
 
+const runtimeModuleRefs = {
+  whatsappLoginTool: {
+    srcFile: "src/channels/plugins/agent-tools/whatsapp-login.ts",
+    distFile: "dist/channels/plugins/agent-tools/whatsapp-login.js",
+  },
+  discordActions: {
+    srcFile: "src/channels/plugins/actions/discord.ts",
+    distFile: "dist/channels/plugins/actions/discord.js",
+  },
+  signalActions: {
+    srcFile: "src/channels/plugins/actions/signal.ts",
+    distFile: "dist/channels/plugins/actions/signal.js",
+  },
+  telegramActions: {
+    srcFile: "src/channels/plugins/actions/telegram.ts",
+    distFile: "dist/channels/plugins/actions/telegram.js",
+  },
+  telegramAudit: {
+    srcFile: "src/telegram/audit.ts",
+    distFile: "dist/telegram/audit.js",
+  },
+  telegramToken: {
+    srcFile: "src/telegram/token.ts",
+    distFile: "dist/telegram/token.js",
+  },
+  lineAccounts: {
+    srcFile: "src/line/accounts.ts",
+    distFile: "dist/line/accounts.js",
+  },
+  lineSend: {
+    srcFile: "src/line/send.ts",
+    distFile: "dist/line/send.js",
+  },
+  lineTemplateMessages: {
+    srcFile: "src/line/template-messages.ts",
+    distFile: "dist/line/template-messages.js",
+  },
+} as const;
+
 function loadWebMediaModule() {
   webMediaPromise ??= import("../../web/media.js");
   return webMediaPromise;
@@ -563,59 +681,63 @@ function loadWhatsAppActions() {
 function loadWhatsAppAgentToolsSync() {
   whatsappAgentToolsModule ??= requireRuntimeModule<
     typeof import("../../channels/plugins/agent-tools/whatsapp-login.js")
-  >("../../channels/plugins/agent-tools/whatsapp-login.js");
+  >(runtimeModuleRefs.whatsappLoginTool);
   return whatsappAgentToolsModule;
 }
 
 function loadDiscordActionsSync() {
   discordActionsModule ??= requireRuntimeModule<
     typeof import("../../channels/plugins/actions/discord.js")
-  >("../../channels/plugins/actions/discord.js");
+  >(runtimeModuleRefs.discordActions);
   return discordActionsModule;
 }
 
 function loadSignalActionsSync() {
   signalActionsModule ??= requireRuntimeModule<
     typeof import("../../channels/plugins/actions/signal.js")
-  >("../../channels/plugins/actions/signal.js");
+  >(runtimeModuleRefs.signalActions);
   return signalActionsModule;
 }
 
 function loadTelegramActionsSync() {
   telegramActionsModule ??= requireRuntimeModule<
     typeof import("../../channels/plugins/actions/telegram.js")
-  >("../../channels/plugins/actions/telegram.js");
+  >(runtimeModuleRefs.telegramActions);
   return telegramActionsModule;
 }
 
 function loadTelegramAuditSync() {
-  telegramAuditModule ??=
-    requireRuntimeModule<typeof import("../../telegram/audit.js")>("../../telegram/audit.js");
+  telegramAuditModule ??= requireRuntimeModule<typeof import("../../telegram/audit.js")>(
+    runtimeModuleRefs.telegramAudit,
+  );
   return telegramAuditModule;
 }
 
 function loadTelegramTokenSync() {
-  telegramTokenModule ??=
-    requireRuntimeModule<typeof import("../../telegram/token.js")>("../../telegram/token.js");
+  telegramTokenModule ??= requireRuntimeModule<typeof import("../../telegram/token.js")>(
+    runtimeModuleRefs.telegramToken,
+  );
   return telegramTokenModule;
 }
 
 function loadLineAccountsSync() {
-  lineAccountsModule ??=
-    requireRuntimeModule<typeof import("../../line/accounts.js")>("../../line/accounts.js");
+  lineAccountsModule ??= requireRuntimeModule<typeof import("../../line/accounts.js")>(
+    runtimeModuleRefs.lineAccounts,
+  );
   return lineAccountsModule;
 }
 
 function loadLineSendSync() {
-  lineSendModule ??=
-    requireRuntimeModule<typeof import("../../line/send.js")>("../../line/send.js");
+  lineSendModule ??= requireRuntimeModule<typeof import("../../line/send.js")>(
+    runtimeModuleRefs.lineSend,
+  );
   return lineSendModule;
 }
 
 function loadLineTemplateMessagesSync() {
   lineTemplateMessagesModule ??= requireRuntimeModule<
     typeof import("../../line/template-messages.js")
-  >("../../line/template-messages.js");
+  >(runtimeModuleRefs.lineTemplateMessages);
   return lineTemplateMessagesModule;
 }
 
